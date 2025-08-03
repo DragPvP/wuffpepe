@@ -5,40 +5,7 @@ import path from "path";
 import { storage } from "./storage";
 import { insertTransactionSchema, insertReferralCodeSchema } from "@shared/schema";
 import { z } from "zod";
-import fs from 'fs';
-
-// Wallet purchase tracking
-interface WalletPurchase {
-  walletAddress: string;
-  walletName: string;
-  amount: string;
-  transactionHash?: string;
-  timestamp: string;
-  currency: string;
-  usdtValue: number;
-  tokenAmount: string;
-}
-
-const WALLET_PURCHASES_FILE = path.resolve(import.meta.dirname, 'wallet-purchases.json');
-
-function loadWalletPurchases(): WalletPurchase[] {
-  try {
-    const data = fs.readFileSync(WALLET_PURCHASES_FILE, 'utf8');
-    return JSON.parse(data);
-  } catch (error) {
-    return [];
-  }
-}
-
-function saveWalletPurchases(purchases: WalletPurchase[]): void {
-  fs.writeFileSync(WALLET_PURCHASES_FILE, JSON.stringify(purchases, null, 2));
-}
-
-function addWalletPurchase(purchase: WalletPurchase): void {
-  const purchases = loadWalletPurchases();
-  purchases.push(purchase);
-  saveWalletPurchases(purchases);
-}
+// Wallet purchase tracking will now use database transactions instead of file storage
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // Serve attached assets
@@ -126,19 +93,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         totalRaised: (currentRaised + usdtValue).toString()
       });
 
-      // Save wallet purchase to JSON file
-      const walletPurchase: WalletPurchase = {
-        walletAddress: validatedData.walletAddress,
-        walletName: `${tokenAmount} PEPEWUFF`,
-        amount: validatedData.payAmount,
-        transactionHash: transaction.txHash || undefined,
-        timestamp: new Date().toISOString(),
-        currency: validatedData.currency,
-        usdtValue: usdtValue,
-        tokenAmount: tokenAmount
-      };
-      
-      addWalletPurchase(walletPurchase);
+      // Transaction is already saved in database, no need for separate file storage
 
       res.json(transaction);
     } catch (error) {
@@ -180,49 +135,45 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Get wallet purchases
-  app.get("/api/wallet-purchases", async (req, res) => {
+  // Get wallet purchases (using database transactions)
+  app.get("/api/wallet/purchase", async (req, res) => {
     try {
-      const purchases = loadWalletPurchases();
-      res.json(purchases);
-    } catch (error) {
-      res.status(500).json({ message: "Failed to fetch wallet purchases" });
-    }
-  });
-
-  // Get wallet purchases for specific address
-  app.get("/api/wallet-purchases/:walletAddress", async (req, res) => {
-    try {
-      const { walletAddress } = req.params;
-      const purchases = loadWalletPurchases();
-      const walletPurchases = purchases.filter(p => p.walletAddress.toLowerCase() === walletAddress.toLowerCase());
+      const { address } = req.query;
+      if (!address) {
+        return res.status(400).json({ message: "Wallet address is required" });
+      }
+      
+      const transactions = await storage.getTransactionsByWallet(address as string);
+      
+      // Transform database transactions to match wallet purchase format
+      const walletPurchases = transactions.map(tx => ({
+        walletAddress: tx.walletAddress,
+        walletName: `${tx.receiveAmount} PEPEWUFF`,
+        amount: tx.payAmount,
+        transactionHash: tx.txHash,
+        timestamp: tx.createdAt.toISOString(),
+        currency: tx.currency,
+        usdtValue: parseFloat(tx.payAmount), // This would need proper conversion in real app
+        tokenAmount: tx.receiveAmount
+      }));
+      
       res.json(walletPurchases);
     } catch (error) {
       res.status(500).json({ message: "Failed to fetch wallet purchases" });
     }
   });
 
-  // Update wallet name
-  app.put("/api/wallet-purchases/:walletAddress/name", async (req, res) => {
+  // Record new wallet purchase (using database transactions)
+  app.post("/api/wallet/purchase", async (req, res) => {
     try {
-      const { walletAddress } = req.params;
-      const { walletName } = req.body;
-      
-      if (!walletName) {
-        return res.status(400).json({ message: "Wallet name is required" });
-      }
-
-      const purchases = loadWalletPurchases();
-      const updatedPurchases = purchases.map(p => 
-        p.walletAddress.toLowerCase() === walletAddress.toLowerCase() 
-          ? { ...p, walletName }
-          : p
-      );
-      
-      saveWalletPurchases(updatedPurchases);
-      res.json({ message: "Wallet name updated successfully" });
+      const validatedData = insertTransactionSchema.parse(req.body);
+      const transaction = await storage.createTransaction(validatedData);
+      res.json(transaction);
     } catch (error) {
-      res.status(500).json({ message: "Failed to update wallet name" });
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid transaction data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to record wallet purchase" });
     }
   });
 
